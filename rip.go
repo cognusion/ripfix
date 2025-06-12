@@ -208,7 +208,7 @@ func supervisor(lock *semaphore.Semaphore, workChan chan work) (progressChan cha
 						// Step 2 get work
 						progressChan <- fmt.Sprintf("[WORKER %d] Work! %+v", i, w)
 
-						// Step 3 ensure path
+						// Step 3a ensure path
 						err = os.MkdirAll(w.tmp, os.ModePerm)
 						if err != nil {
 							progressChan <- fmt.Errorf("[WORKER %d] Error MkdirAll '%s': %w", i, w.tmp, err)
@@ -220,28 +220,22 @@ func supervisor(lock *semaphore.Semaphore, workChan chan work) (progressChan cha
 							defer os.RemoveAll(w.tmp)
 						}
 
-						// Step 4a explode PDFs into TIFFs
+						// Step 3b craft the future file names, and see if the compressed product exists for an early exit.
 						outFile := w.out + strings.TrimSuffix(filepath.Base(w.pdf), filepath.Ext(filepath.Base(w.pdf))) + "_fixed" // tesseract wants an extensionless filename
+						compressFile := fmt.Sprintf("%s_%s.pdf", outFile, w.compress)
+						if w.compress != "none" && w.skipExisting && fileExists(compressFile) {
+							progressChan <- fmt.Sprintf("[WORKER %d] Compress file '%s' already exists. Skipping all the things!", i, compressFile)
+							return
+						}
+
+						// Step 4 rip PDFs into TIFFs
+						// Step 5 OCR the TIFFs and fix them into PDFs again
 						if !(w.skipExisting && fileExists(outFile+".pdf")) {
 							progressChan <- fmt.Sprintf("[WORKER %d] pdfToTiff(%s, %s)", i, w.pdf, w.tmp)
-							err = pdfToTiff(w.pdf, w.tmp)
-							if err != nil {
-								progressChan <- fmt.Errorf("[WORKER %d] Error pdftoppm '%s' -> '%s': %w", i, w.pdf, w.tmp, err)
-								return
-							}
-							// Step 4b create list of result files, w.tmp+w.id+".lst"
-							progressChan <- fmt.Sprintf("[WORKER %d] createTiffList", i)
-							listFile, lErr := createTiffList(&w)
-							if lErr != nil {
-								progressChan <- fmt.Errorf("[WORKER %d] Error createTiffList: %w", i, lErr)
-								return
-							}
 
-							// Step 5 tesseract the TIFFs
-							progressChan <- fmt.Sprintf("[WORKER %d] tesseract(%s, %s)", i, listFile, outFile)
-							err = tesseract(listFile, outFile)
+							err = w.ripfix(i, progressChan)
 							if err != nil {
-								progressChan <- fmt.Errorf("[WORKER %d] Error tesseract '%s' -> '%s': %w", i, w.tmp, outFile, err)
+								progressChan <- fmt.Errorf("[WORKER %d] Error: %w", i, err)
 								return
 							}
 						} else {
@@ -251,7 +245,6 @@ func supervisor(lock *semaphore.Semaphore, workChan chan work) (progressChan cha
 
 						// Step 6 maybe compress the images in the PDF
 						if w.compress != "none" {
-							compressFile := fmt.Sprintf("%s_%s.pdf", outFile, w.compress)
 							nOutFile := outFile + ".pdf"
 							if !(w.skipExisting && fileExists(compressFile)) {
 								progressChan <- fmt.Sprintf("[WORKER %d] compressPdf(%s, %s, %s)", i, w.compress, nOutFile, compressFile)
@@ -325,20 +318,46 @@ func simpleRun(name string, args ...string) error {
 	return cmd.Run()
 }
 
-// pdfToTiff constructs a pdftoppm Command to extract PDF pages as TIFF images.
-func pdfToTiff(pdf string, outFolder string) error {
-	return simpleRun("pdftoppm", "-tiff", "-r", "300", pdf, outFolder+"page")
+// ripfix abstracts some clumsy code to get it out of the supervisor, and attach it to the work.
+// The next generation will put all of the code on the work so the supervisor can just handle errors and keep the workers working.
+func (w *work) ripfix(i int, progressChan chan any) error {
+	var (
+		err     error
+		outFile = w.out + strings.TrimSuffix(filepath.Base(w.pdf), filepath.Ext(filepath.Base(w.pdf))) + "_fixed"
+	)
+
+	// Step 4a rip the PDF into TIFFs
+	err = pdfToTiff(w.pdf, w.tmp)
+	if err != nil {
+		return fmt.Errorf("pdftoppm '%s' -> '%s': %w", w.pdf, w.tmp, err)
+	}
+	// Step 4b create list of result files, w.tmp+w.id+".lst"
+	progressChan <- fmt.Sprintf("[WORKER %d] createTiffList", i)
+
+	listFile, lErr := w.createTiffList()
+	if lErr != nil {
+		return fmt.Errorf("createTiffList: %w", lErr)
+	}
+
+	// Step 5 tesseract the TIFFs
+	progressChan <- fmt.Sprintf("[WORKER %d] tesseract(%s, %s)", i, listFile, outFile)
+	err = tesseract(listFile, outFile)
+	if err != nil {
+		return fmt.Errorf("tesseract '%s' -> '%s': %w", w.tmp, outFile, err)
+	}
+
+	return nil
 }
 
 // createTiffList assembles a list of -presumably- the TIFF images created by pdfToTiff,
 // writing it to a file that tesseract can read.
-func createTiffList(w *work) (string, error) {
+func (w *work) createTiffList() (string, error) {
 	var (
 		gfiles []string
 		f      *os.File
 		err    error
 	)
-	listFile := w.tmp + w.id + ".lst"
+	listFile := fmt.Sprintf("%s%s.lst", w.tmp, w.id)
 	gfiles, err = filepath.Glob(w.tmp + "*.tif")
 	if err != nil {
 		return "", fmt.Errorf("error getting tiffs '%s': %w", w.tmp, err)
@@ -354,6 +373,11 @@ func createTiffList(w *work) (string, error) {
 		}
 	}
 	return listFile, nil
+}
+
+// pdfToTiff constructs a pdftoppm Command to extract PDF pages as TIFF images.
+func pdfToTiff(pdf string, outFolder string) error {
+	return simpleRun("pdftoppm", "-tiff", "-r", "300", pdf, outFolder+"page")
 }
 
 // tesseract constructs a tesseract Command to do OCR on the TIFF images and reassemble them as a PDF.
