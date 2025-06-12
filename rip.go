@@ -294,7 +294,7 @@ func buildList(files []string) []string {
 	l := make([]string, 0)
 	for _, file := range files {
 		//fmt.Printf("[FILE] %s\n", file)
-		if strings.Contains(file, "*") {
+		if strings.Contains(file, "*") || strings.Contains(file, "?") {
 			gfiles, err := filepath.Glob(file)
 			if err != nil {
 				panic(err)
