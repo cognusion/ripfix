@@ -23,6 +23,7 @@ go install github.com/cognusion/ripfix@latest
 Usage of ripfix:
       --clean             Remove temp folders/files when complete. (default true)
   -c, --compress string   Set a compression target to one of 'none' (300DPI), 'ebook' (150DPI), or 'screen' (72DPI). (default "none")
+      --flock string      Location of a file lock file, to ensure two copies of ripfix aren't running at the same time. (default "/tmp/ripfix.lock")
   -m, --max int           Maximum number of simultaneous processors. (default 12)
   -o, --out string        Location to place the final products. They will have the same file name as the source. (default "./")
   -p, --pdfs strings      List of PDFs to convert. Globs are fine. Quotes are encouraged.
@@ -45,6 +46,15 @@ If this is false, expect a lot of plaque in your *--temp* **ripfix** directory.
 If this value not *none*, after **ripfix** generates a *_fixed* PDF, it will run **ps2pdf** with this value as the target style. The TIFFs are ripped out at 300DPI, and reassembled at the same, so values at/above that are pointless leaving *"ebook"* (150DPI-ish) and *"screen"* (72DPI-ish).
 
 Of note, if *clean* is true, the *_fixed* PDF will be removed after the compressed version of *_fixed_[style]* is finished.
+
+### flock
+
+*default: [OS-reported temp location]/ripfix.lock*
+
+Location of a file that will be locked when an instance of **ripfix** is running. If another is started up it will be unable to lock the file and return an appropriate message whilst exiting.
+
+While not strictly prohibitive if multiple instances of ripfix are running, they *must* all be running *clean==false* or they will clobber each other on the way out. This solves that.
+
 
 ### max
 

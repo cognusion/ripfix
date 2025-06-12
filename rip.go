@@ -13,6 +13,7 @@ import (
 
 	"github.com/cognusion/go-sequence"
 	"github.com/cognusion/semaphore"
+	"github.com/gofrs/flock"
 	"github.com/spf13/pflag"
 )
 
@@ -25,6 +26,7 @@ var (
 	compress     string
 	skipExisting bool
 	clean        bool
+	flockFile    string
 )
 
 // work gets passed around to various funcs/goros.
@@ -46,6 +48,7 @@ func init() {
 	pflag.BoolVar(&clean, "clean", true, "Remove temp folders/files when complete.")
 	pflag.StringVarP(&compress, "compress", "c", "none", "Set a compression target to one of 'none' (300DPI), 'ebook' (150DPI), or 'screen' (72DPI).")
 	pflag.BoolVar(&skipExisting, "skip", true, "If a suffixed file is encountered, assume it is correct and don't do that part of the process again.")
+	pflag.StringVar(&flockFile, "flock", os.TempDir()+"/ripfix.lock", "Location of a file lock file, to ensure two copies of ripfix aren't running at the same time.")
 
 	pflag.Parse()
 
@@ -83,6 +86,22 @@ func main() {
 	)
 
 	// Step -1 Check and set
+
+	// flocking. While not strictly prohibitive if multiple instances of ripfix are running,
+	// they *must* all be running --clean=false and that's not the funnest thing to police,
+	// so here we are
+	fileLock := flock.New(flockFile)
+	locked, err := fileLock.TryLock()
+	if err != nil {
+		panic(fmt.Errorf("error while trying to flock %s: %w", flockFile, err))
+	}
+	if locked {
+		// Bingo!
+		defer fileLock.Unlock()
+	} else {
+		fmt.Println("Only one instance of ripfix should be running at a time.")
+		os.Exit(1)
+	}
 
 	// Check for pdftoppm, tesseract, and possibly ps2pdf
 	if _, err := exec.LookPath("pdftoppm"); err != nil {
@@ -128,7 +147,6 @@ func main() {
 			switch v := p.(type) {
 			case error:
 				fmt.Printf("[PROGRESS] ERROR: %s\n", v)
-				os.Exit(1)
 			case string:
 				fmt.Printf("[PROGRESS] %s\n", v)
 			default:
