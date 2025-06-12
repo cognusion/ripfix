@@ -284,7 +284,7 @@ func buildList(files []string) []string {
 			l = append(l, buildList(gfiles)...) // recursion
 		} else if s, err := os.Stat(file); err != nil {
 			// We we can't stat the thing, something is very wrong.
-			panic(err)
+			panic(fmt.Errorf("file %s cannot be found: %w", file, err))
 		} else if !s.IsDir() {
 			// file
 			l = append(l, file)
