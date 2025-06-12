@@ -1,7 +1,9 @@
 package main
 
 import (
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -15,21 +17,25 @@ import (
 )
 
 var (
-	pdfs      []string
-	maxP      int
-	out       string
-	tmp       string
-	tmpFolder = "ripfix"
-	clean     bool
+	pdfs         []string
+	maxP         int
+	out          string
+	tmp          string
+	tmpFolder    = "ripfix"
+	compress     string
+	skipExisting bool
+	clean        bool
 )
 
 // work gets passed around to various funcs/goros.
 type work struct {
-	id    string
-	pdf   string
-	tmp   string
-	out   string
-	clean bool
+	id           string
+	pdf          string
+	tmp          string
+	out          string
+	compress     string
+	skipExisting bool
+	clean        bool
 }
 
 func init() {
@@ -38,6 +44,8 @@ func init() {
 	pflag.StringVarP(&tmp, "temp", "t", os.TempDir()+"/", "Location for temp files.")
 	pflag.IntVarP(&maxP, "max", "m", runtime.NumCPU(), "Maximum number of simultaneous processors.")
 	pflag.BoolVar(&clean, "clean", true, "Remove temp folders/files when complete.")
+	pflag.StringVarP(&compress, "compress", "c", "none", "Set a compression target to one of 'none' (300DPI), 'ebook' (150DPI), or 'screen' (72DPI).")
+	pflag.BoolVar(&skipExisting, "skip", true, "If a suffixed file is encountered, assume it is correct and don't do that part of the process again.")
 
 	pflag.Parse()
 
@@ -58,6 +66,11 @@ func init() {
 	if !strings.HasSuffix(out, "/") {
 		out += "/"
 	}
+	if !(compress == "none" || compress == "ebook" || compress == "screen") {
+		fmt.Printf("Compress option invalid: %s\n", compress)
+		pflag.PrintDefaults()
+		os.Exit(1)
+	}
 }
 
 func main() {
@@ -71,7 +84,7 @@ func main() {
 
 	// Step -1 Check and set
 
-	// Check for pdftoppm and tesseract
+	// Check for pdftoppm, tesseract, and possibly ps2pdf
 	if _, err := exec.LookPath("pdftoppm"); err != nil {
 		fmt.Println("Could not find path to pdftoppm!")
 		os.Exit(1)
@@ -79,6 +92,12 @@ func main() {
 	if _, err := exec.LookPath("tesseract"); err != nil {
 		fmt.Println("Could not find path to tesseract!")
 		os.Exit(1)
+	}
+	if compress != "none" {
+		if _, err := exec.LookPath("ps2pdf"); err != nil {
+			fmt.Println("Could not find path to ps2pdf!")
+			os.Exit(1)
+		}
 	}
 
 	// Confirm out is a folder
@@ -123,11 +142,13 @@ func main() {
 		id := seq.NextHashID()
 		//fmt.Printf("[WORKFILE] %s is %s\n", file, id)
 		workChan <- work{
-			id:    id,
-			pdf:   file,
-			tmp:   fmt.Sprintf("%s%s/%d.%s/", tmp, tmpFolder, pid, id),
-			out:   out,
-			clean: clean,
+			id:           id,
+			pdf:          file,
+			tmp:          fmt.Sprintf("%s%s/%d.%s/", tmp, tmpFolder, pid, id),
+			out:          out,
+			compress:     compress,
+			skipExisting: skipExisting,
+			clean:        clean,
 		}
 	}
 	// POST: each work{} has been consumed by a worker.
@@ -182,31 +203,59 @@ func supervisor(lock *semaphore.Semaphore, workChan chan work) (progressChan cha
 						}
 
 						// Step 4a explode PDFs into TIFFs
-						progressChan <- fmt.Sprintf("[WORKER %d] pdfToTiff(%s, %s)", i, w.pdf, w.tmp)
-						err = pdfToTiff(w.pdf, w.tmp)
-						if err != nil {
-							progressChan <- fmt.Errorf("[WORKER %d] Error pdftoppm '%s' -> '%s': %w", i, w.pdf, w.tmp, err)
-							return
-						}
-						// Step 4b create list of result files, w.tmp+w.id+".lst"
-						progressChan <- fmt.Sprintf("[WORKER %d] createTiffList", i)
-						listFile, lErr := createTiffList(&w)
-						if lErr != nil {
-							progressChan <- fmt.Errorf("[WORKER %d] Error createTiffList: %w", i, lErr)
-							return
-						}
-
-						// Step 5 tesseract the TIFFs
 						outFile := w.out + strings.TrimSuffix(filepath.Base(w.pdf), filepath.Ext(filepath.Base(w.pdf))) + "_fixed" // tesseract wants an extensionless filename
-						progressChan <- fmt.Sprintf("[WORKER %d] tesseract(%s, %s)", i, listFile, outFile)
-						err = tesseract(listFile, outFile)
-						if err != nil {
-							progressChan <- fmt.Errorf("[WORKER %d] Error tesseract '%s' -> '%s': %w", i, w.tmp, outFile, err)
-							return
+						if !(w.skipExisting && fileExists(outFile+".pdf")) {
+							progressChan <- fmt.Sprintf("[WORKER %d] pdfToTiff(%s, %s)", i, w.pdf, w.tmp)
+							err = pdfToTiff(w.pdf, w.tmp)
+							if err != nil {
+								progressChan <- fmt.Errorf("[WORKER %d] Error pdftoppm '%s' -> '%s': %w", i, w.pdf, w.tmp, err)
+								return
+							}
+							// Step 4b create list of result files, w.tmp+w.id+".lst"
+							progressChan <- fmt.Sprintf("[WORKER %d] createTiffList", i)
+							listFile, lErr := createTiffList(&w)
+							if lErr != nil {
+								progressChan <- fmt.Errorf("[WORKER %d] Error createTiffList: %w", i, lErr)
+								return
+							}
+
+							// Step 5 tesseract the TIFFs
+							progressChan <- fmt.Sprintf("[WORKER %d] tesseract(%s, %s)", i, listFile, outFile)
+							err = tesseract(listFile, outFile)
+							if err != nil {
+								progressChan <- fmt.Errorf("[WORKER %d] Error tesseract '%s' -> '%s': %w", i, w.tmp, outFile, err)
+								return
+							}
+						} else {
+							progressChan <- fmt.Sprintf("[WORKER %d] %s.pdf found, skipping pdfToTiff and tesseract", i, outFile)
+						}
+						productFile := outFile + ".pdf"
+
+						// Step 6 maybe compress the images in the PDF
+						if w.compress != "none" {
+							compressFile := fmt.Sprintf("%s_%s.pdf", outFile, w.compress)
+							nOutFile := outFile + ".pdf"
+							if !(w.skipExisting && fileExists(compressFile)) {
+								progressChan <- fmt.Sprintf("[WORKER %d] compressPdf(%s, %s, %s)", i, w.compress, nOutFile, compressFile)
+								err = compressPdf(w.compress, nOutFile, compressFile)
+								if err != nil {
+									progressChan <- fmt.Errorf("[WORKER %d] Error compressPdf '%s' '%s' -> '%s': %w", i, w.compress, nOutFile, compressFile, err)
+									return
+								}
+							} else {
+								progressChan <- fmt.Sprintf("[WORKER %d] %s found, skipping compressPdf", i, compressFile)
+							}
+							productFile = compressFile // update
+							if w.clean {
+								// I'm conflicted about this, as it took a lot of work to make that file, and if we don't like the compressed version,
+								// we may want to recompress it using a different setting "manually", but also understand why we're doing this, as 1G PDFs
+								// are better as 200MB PDFs, not 1200MBs of PDFs :)
+								defer os.Remove(nOutFile)
+							}
 						}
 
-						// Step 5 celebrate!
-						progressChan <- fmt.Sprintf("[WORKER %d] Completed Work! See '%s.pdf'", i, outFile)
+						// Step N celebrate!
+						progressChan <- fmt.Sprintf("[WORKER %d] Completed Work! See '%s'", i, productFile)
 					case <-doneChan:
 						// That's all folks!
 						return
@@ -242,6 +291,14 @@ func buildList(files []string) []string {
 		}
 	}
 	return l
+}
+
+// fileExists returns true if a file exists, and false if it doesn't.
+func fileExists(file string) bool {
+	if _, err := os.Stat(file); errors.Is(err, fs.ErrNotExist) {
+		return false
+	}
+	return true
 }
 
 // simplerun is an abstraction to execute a Command.
@@ -284,4 +341,9 @@ func createTiffList(w *work) (string, error) {
 // tesseract constructs a tesseract Command to do OCR on the TIFF images and reassemble them as a PDF.
 func tesseract(fileList, outpath string) error {
 	return simpleRun("tesseract", fileList, outpath, "pdf")
+}
+
+// compress again pulls apart the PDF, an compresses the PDF using ps2pdf
+func compressPdf(style, pdfin, pdfout string) error {
+	return simpleRun("ps2pdf", "-dPDFSETTINGS=/"+style, pdfin, pdfout)
 }
