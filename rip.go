@@ -27,6 +27,7 @@ var (
 	skipExisting bool
 	clean        bool
 	flockFile    string
+	skipFlock    bool
 )
 
 // work gets passed around to various funcs/goros.
@@ -49,7 +50,9 @@ func init() {
 	pflag.StringVarP(&compress, "compress", "c", "none", "Set a compression target to one of 'none' (300DPI), 'ebook' (150DPI), or 'screen' (72DPI).")
 	pflag.BoolVar(&skipExisting, "skip", true, "If a suffixed file is encountered, assume it is correct and don't do that part of the process again.")
 	pflag.StringVar(&flockFile, "flock", os.TempDir()+"/ripfix.lock", "Location of a file lock file, to ensure two copies of ripfix aren't running at the same time.")
+	pflag.BoolVar(&skipFlock, "ignore-flock", false, "DANGER: If true, skips flocking.")
 
+	pflag.CommandLine.MarkHidden("ignore-flock")
 	pflag.Parse()
 
 	if len(pdfs) == 0 {
@@ -89,18 +92,20 @@ func main() {
 
 	// flocking. While not strictly prohibitive if multiple instances of ripfix are running,
 	// they *must* all be running --clean=false and that's not the funnest thing to police,
-	// so here we are
-	fileLock := flock.New(flockFile)
-	locked, err := fileLock.TryLock()
-	if err != nil {
-		panic(fmt.Errorf("error while trying to flock %s: %w", flockFile, err))
-	}
-	if locked {
-		// Bingo!
-		defer fileLock.Unlock()
-	} else {
-		fmt.Println("Only one instance of ripfix should be running at a time.")
-		os.Exit(1)
+	// so here we are. skipFlock is enabled using a hidden option "ignore-flock".
+	if skipFlock {
+		fileLock := flock.New(flockFile)
+		locked, err := fileLock.TryLock()
+		if err != nil {
+			panic(fmt.Errorf("error while trying to flock %s: %w", flockFile, err))
+		}
+		if locked {
+			// Bingo!
+			defer fileLock.Unlock()
+		} else {
+			fmt.Println("Only one instance of ripfix should be running at a time.")
+			os.Exit(1)
+		}
 	}
 
 	// Check for pdftoppm, tesseract, and possibly ps2pdf
