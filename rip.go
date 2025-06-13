@@ -96,9 +96,23 @@ func main() {
 		outLog   = log.New(os.Stderr, "", log.LstdFlags)
 
 		barTmpl = `{{ counters . }} {{ bar . }} {{ percent . }}`
-		barChan = make(chan int) // for the PB
+		barChan chan int
 	)
-	defer close(barChan)
+	if useBar {
+		barChan = make(chan int)
+		defer close(barChan)
+
+		go func() {
+			totalGuess := <-barChan // first item is the anticipated number of steps
+			bar := pb.ProgressBarTemplate(barTmpl).Start(totalGuess)
+			// bar.Set(pb.Bytes, true)
+			defer bar.Finish()
+
+			for b := range barChan {
+				bar.Add(b)
+			}
+		}()
+	}
 
 	// Step -1 Check and set
 
@@ -193,25 +207,8 @@ func main() {
 		}
 	}()
 
-	if useBar {
-		go func() {
-			totalGuess := <-barChan // first item is the anticipated number of steps
-			bar := pb.ProgressBarTemplate(barTmpl).Start(totalGuess)
-			// bar.Set(pb.Bytes, true)
-			defer bar.Finish()
-
-			for b := range barChan {
-				bar.Add(b)
-			}
-		}()
-	}
-
 	// Step 1 build work and dole it out
-	files := buildList(pdfs)
-	if useBar {
-		barChan <- len(files)
-	}
-	for _, file := range files {
+	for _, file := range buildList(pdfs, barChan) {
 		id := seq.NextHashID()
 		//outLog.Printf("[WORKFILE] %s is %s\n", file, id)
 		workChan <- work{
@@ -279,6 +276,7 @@ func supervisor(lock *semaphore.Semaphore, workChan chan work) (progressChan cha
 						outFile := w.out + strings.TrimSuffix(filepath.Base(w.pdf), filepath.Ext(filepath.Base(w.pdf))) + "_fixed" // tesseract wants an extensionless filename
 						compressFile := fmt.Sprintf("%s_%s.pdf", outFile, w.compress)
 						if w.compress != "none" && w.skipExisting && fileExists(compressFile) {
+							// There is no need to craft _fixed if _fixed_[compress] exists.
 							progressChan <- fmt.Sprintf("[WORKER %d] Compress file '%s' already exists. Completed Work! Skipping all the things!", i, compressFile)
 							return
 						}
@@ -313,7 +311,7 @@ func supervisor(lock *semaphore.Semaphore, workChan chan work) (progressChan cha
 							}
 							productFile = compressFile // update
 							if w.clean {
-								// I'm conflicted about this, as it took a lot of work to make that file, and if we don't like the compressed version,
+								// We are conflicted about this, as it took a lot of work to make that file, and if we don't like the compressed version,
 								// we may want to recompress it using a different setting "manually", but also understand why we're doing this, as 1G PDFs
 								// are better as 200MB PDFs, not 1200MBs of PDFs :)
 								defer os.Remove(nOutFile)
@@ -338,7 +336,7 @@ func supervisor(lock *semaphore.Semaphore, workChan chan work) (progressChan cha
 }
 
 // buildList will possibly recursively (if a glob is provided) create a list of files to assign as work.
-func buildList(files []string) []string {
+func buildList(files []string, count chan int) []string {
 	l := make([]string, 0)
 	for _, file := range files {
 		//fmt.Printf("[FILE] %s\n", file)
@@ -347,7 +345,7 @@ func buildList(files []string) []string {
 			if err != nil {
 				panic(err)
 			}
-			l = append(l, buildList(gfiles)...) // recursion
+			l = append(l, buildList(gfiles, nil)...) // recursion, but don't send the chan!
 		} else if s, err := os.Stat(file); err != nil {
 			// We we can't stat the thing, something is very wrong.
 			panic(fmt.Errorf("file %s cannot be found: %w", file, err))
@@ -355,6 +353,9 @@ func buildList(files []string) []string {
 			// file
 			l = append(l, file)
 		}
+	}
+	if count != nil {
+		count <- len(l)
 	}
 	return l
 }
