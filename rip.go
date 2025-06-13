@@ -189,19 +189,24 @@ func main() {
 		for p := range progressChan {
 			switch v := p.(type) {
 			case error:
+				// Always print errors.
 				outLog.Printf("[PROGRESS] ERROR: %s\n", v)
 			case string:
+				if logFile != "" {
+					// Always print if we're logging.
+					outLog.Printf("[PROGRESS] %s\n", v)
+				}
+
 				if useBar {
 					if strings.Contains(v, "Completed Work!") {
 						barChan <- 1
 					}
-					if logFile != "" {
-						outLog.Printf("[PROGRESS] %s\n", v)
-					}
-				} else {
+				} else if logFile == "" {
+					// If we are not using the bar, and not logging, print.
 					outLog.Printf("[PROGRESS] %s\n", v)
 				}
 			default:
+				// Always print weird shit.
 				outLog.Printf("[PROGRESS] ??: %+v\n", v)
 			}
 		}
@@ -242,7 +247,6 @@ func supervisor(lock *semaphore.Semaphore, workChan chan work) (progressChan cha
 	progressChan = make(chan any)
 
 	go func() {
-		// TODO: Get rid of this incrementer. But good for debugging.
 		c := 0
 		for {
 			c++
@@ -256,8 +260,8 @@ func supervisor(lock *semaphore.Semaphore, workChan chan work) (progressChan cha
 
 					select {
 					case w := <-workChan:
-						var err error
 						// Step 2 get work
+						var err error
 						progressChan <- fmt.Sprintf("[WORKER %d] Work! %+v", i, w)
 
 						// Step 3a ensure path
@@ -273,7 +277,7 @@ func supervisor(lock *semaphore.Semaphore, workChan chan work) (progressChan cha
 						}
 
 						// Step 3b craft the future file names, and see if the compressed product exists for an early exit.
-						outFile := w.out + strings.TrimSuffix(filepath.Base(w.pdf), filepath.Ext(filepath.Base(w.pdf))) + "_fixed" // tesseract wants an extensionless filename
+						outFile := fmt.Sprintf("%s%s_fixed", w.out, strings.TrimSuffix(filepath.Base(w.pdf), filepath.Ext(filepath.Base(w.pdf)))) // tesseract wants an extensionless filename
 						compressFile := fmt.Sprintf("%s_%s.pdf", outFile, w.compress)
 						if w.compress != "none" && w.skipExisting && fileExists(compressFile) {
 							// There is no need to craft _fixed if _fixed_[compress] exists.
@@ -379,7 +383,7 @@ func simpleRun(name string, args ...string) error {
 func (w *work) ripfix(i int, progressChan chan any) error {
 	var (
 		err     error
-		outFile = w.out + strings.TrimSuffix(filepath.Base(w.pdf), filepath.Ext(filepath.Base(w.pdf))) + "_fixed"
+		outFile = fmt.Sprintf("%s%s_fixed", w.out, strings.TrimSuffix(filepath.Base(w.pdf), filepath.Ext(filepath.Base(w.pdf)))) // tesseract wants an extensionless filename
 	)
 
 	// Step 4a rip the PDF into TIFFs
