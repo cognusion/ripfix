@@ -3,7 +3,9 @@ package main
 import (
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -11,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/cheggaaa/pb/v3"
 	"github.com/cognusion/go-sequence"
 	"github.com/cognusion/semaphore"
 	"github.com/gofrs/flock"
@@ -28,6 +31,9 @@ var (
 	clean        bool
 	flockFile    string
 	skipFlock    bool
+	useBar       bool
+
+	outLog = log.New(io.Discard, "", log.LstdFlags)
 )
 
 // work gets passed around to various funcs/goros.
@@ -51,6 +57,7 @@ func init() {
 	pflag.BoolVar(&skipExisting, "skip", true, "If a suffixed file is encountered, assume it is correct and don't do that part of the process again.")
 	pflag.StringVar(&flockFile, "flock", os.TempDir()+"/ripfix.lock", "Location of a file lock file, to ensure two copies of ripfix aren't running at the same time.")
 	pflag.BoolVar(&skipFlock, "ignore-flock", false, "DANGER: If true, skips flocking.")
+	pflag.BoolVar(&useBar, "bar", false, "Enable progress bar, suppress normal non-error screen logging.")
 
 	pflag.CommandLine.MarkHidden("ignore-flock")
 	pflag.Parse()
@@ -86,15 +93,21 @@ func main() {
 		seq      = sequence.New(1)
 		sem      = semaphore.NewSemaphore(maxP)
 		workChan = make(chan work)
+		fileLock *flock.Flock
+
+		bar     *pb.ProgressBar
+		barTmpl = `{{ counters . }} {{ bar . }} {{ percent . }}`
+		barChan = make(chan int) // for the PB
 	)
+	defer close(barChan)
 
 	// Step -1 Check and set
 
 	// flocking. While not strictly prohibitive if multiple instances of ripfix are running,
 	// they *must* all be running --clean=false and that's not the funnest thing to police,
 	// so here we are. skipFlock is enabled using a hidden option "ignore-flock".
-	if skipFlock {
-		fileLock := flock.New(flockFile)
+	if !skipFlock {
+		fileLock = flock.New(flockFile)
 		locked, err := fileLock.TryLock()
 		if err != nil {
 			panic(fmt.Errorf("error while trying to flock %s: %w", flockFile, err))
@@ -140,6 +153,8 @@ func main() {
 		defer os.RemoveAll(tmp + tmpFolder)
 	}
 
+	// Oy! No printing other than to logs from this point!
+
 	// Step 0 workers
 	// We are ok with starting too many workers, as any unneeded will just exit
 	// after the work is assigned.
@@ -151,19 +166,42 @@ func main() {
 		for p := range progressChan {
 			switch v := p.(type) {
 			case error:
-				fmt.Printf("[PROGRESS] ERROR: %s\n", v)
+				outLog.Printf("[PROGRESS] ERROR: %s\n", v)
 			case string:
-				fmt.Printf("[PROGRESS] %s\n", v)
+				if useBar {
+					if strings.Contains(v, "Completed Work!") {
+						barChan <- 1
+					}
+				} else {
+					outLog.Printf("[PROGRESS] %s\n", v)
+				}
 			default:
-				fmt.Printf("[PROGRESS] ??: %+v\n", v)
+				outLog.Printf("[PROGRESS] ??: %+v\n", v)
 			}
 		}
 	}()
 
+	if useBar {
+		go func(progress <-chan int) {
+			totalGuess := <-progress // first item is the anticipated number of steps
+			bar = pb.ProgressBarTemplate(barTmpl).Start(totalGuess)
+			//bar.Set(pb.Bytes, true)
+			defer bar.Finish()
+
+			for b := range <-progress {
+				bar.Add(b)
+			}
+		}(barChan)
+	}
+
 	// Step 1 build work and dole it out
-	for _, file := range buildList(pdfs) {
+	files := buildList(pdfs)
+	if useBar {
+		barChan <- len(files)
+	}
+	for _, file := range files {
 		id := seq.NextHashID()
-		//fmt.Printf("[WORKFILE] %s is %s\n", file, id)
+		//outLog.Printf("[WORKFILE] %s is %s\n", file, id)
 		workChan <- work{
 			id:           id,
 			pdf:          file,
@@ -229,7 +267,7 @@ func supervisor(lock *semaphore.Semaphore, workChan chan work) (progressChan cha
 						outFile := w.out + strings.TrimSuffix(filepath.Base(w.pdf), filepath.Ext(filepath.Base(w.pdf))) + "_fixed" // tesseract wants an extensionless filename
 						compressFile := fmt.Sprintf("%s_%s.pdf", outFile, w.compress)
 						if w.compress != "none" && w.skipExisting && fileExists(compressFile) {
-							progressChan <- fmt.Sprintf("[WORKER %d] Compress file '%s' already exists. Skipping all the things!", i, compressFile)
+							progressChan <- fmt.Sprintf("[WORKER %d] Compress file '%s' already exists. Completed Work! Skipping all the things!", i, compressFile)
 							return
 						}
 
