@@ -21,6 +21,7 @@ go install github.com/cognusion/ripfix@latest
 
 ```bash
 Usage of ripfix:
+      --bar               Enable progress bar, suppress normal non-error screen logging.
       --clean             Remove temp folders/files when complete. (default true)
   -c, --compress string   Set a compression target to one of 'none' (300DPI), 'ebook' (150DPI), or 'screen' (72DPI). (default "none")
       --flock string      Location of a file lock file, to ensure two copies of ripfix aren't running at the same time. (default "/tmp/ripfix.lock")
@@ -30,6 +31,11 @@ Usage of ripfix:
       --skip              If a suffixed file is encountered, assume it is correct and don't do that part of the process again. (default true)
   -t, --temp string       Location for temp files. (default "/tmp/")
 ```
+### bar
+
+*default: false*
+
+If true, suppress non-error output and toss up a progress bar, ticking away as each file stage is complete.
 
 ### clean
 

@@ -3,7 +3,6 @@ package main
 import (
 	"errors"
 	"fmt"
-	"io"
 	"io/fs"
 	"log"
 	"os"
@@ -32,8 +31,6 @@ var (
 	flockFile    string
 	skipFlock    bool
 	useBar       bool
-
-	outLog = log.New(io.Discard, "", log.LstdFlags)
 )
 
 // work gets passed around to various funcs/goros.
@@ -95,7 +92,6 @@ func main() {
 		workChan = make(chan work)
 		fileLock *flock.Flock
 
-		bar     *pb.ProgressBar
 		barTmpl = `{{ counters . }} {{ bar . }} {{ percent . }}`
 		barChan = make(chan int) // for the PB
 	)
@@ -166,32 +162,33 @@ func main() {
 		for p := range progressChan {
 			switch v := p.(type) {
 			case error:
-				outLog.Printf("[PROGRESS] ERROR: %s\n", v)
+				log.Printf("[PROGRESS] ERROR: %s\n", v)
 			case string:
 				if useBar {
 					if strings.Contains(v, "Completed Work!") {
 						barChan <- 1
 					}
 				} else {
-					outLog.Printf("[PROGRESS] %s\n", v)
+					log.Printf("[PROGRESS] %s\n", v)
 				}
 			default:
-				outLog.Printf("[PROGRESS] ??: %+v\n", v)
+				log.Printf("[PROGRESS] ??: %+v\n", v)
 			}
 		}
 	}()
 
 	if useBar {
-		go func(progress <-chan int) {
-			totalGuess := <-progress // first item is the anticipated number of steps
-			bar = pb.ProgressBarTemplate(barTmpl).Start(totalGuess)
-			//bar.Set(pb.Bytes, true)
+		go func() {
+			totalGuess := <-barChan // first item is the anticipated number of steps
+			bar := pb.ProgressBarTemplate(barTmpl).Start(totalGuess)
+			// bar.Set(pb.Bytes, true)
 			defer bar.Finish()
+			defer log.Println("The bar is too damn high!")
 
-			for b := range <-progress {
+			for b := range barChan {
 				bar.Add(b)
 			}
-		}(barChan)
+		}()
 	}
 
 	// Step 1 build work and dole it out
@@ -201,7 +198,7 @@ func main() {
 	}
 	for _, file := range files {
 		id := seq.NextHashID()
-		//outLog.Printf("[WORKFILE] %s is %s\n", file, id)
+		//log.Printf("[WORKFILE] %s is %s\n", file, id)
 		workChan <- work{
 			id:           id,
 			pdf:          file,
