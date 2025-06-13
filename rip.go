@@ -31,6 +31,7 @@ var (
 	flockFile    string
 	skipFlock    bool
 	useBar       bool
+	logFile      string
 )
 
 // work gets passed around to various funcs/goros.
@@ -54,7 +55,8 @@ func init() {
 	pflag.BoolVar(&skipExisting, "skip", true, "If a suffixed file is encountered, assume it is correct and don't do that part of the process again.")
 	pflag.StringVar(&flockFile, "flock", os.TempDir()+"/ripfix.lock", "Location of a file lock file, to ensure two copies of ripfix aren't running at the same time.")
 	pflag.BoolVar(&skipFlock, "ignore-flock", false, "DANGER: If true, skips flocking.")
-	pflag.BoolVar(&useBar, "bar", false, "Enable progress bar, suppress normal non-error screen logging.")
+	pflag.BoolVarP(&useBar, "bar", "b", false, "Enable progress bar, suppress normal non-error screen logging.")
+	pflag.StringVarP(&logFile, "log", "l", "", "If set, normal screen logging will go to the file instead, including when used with --bar.")
 
 	pflag.CommandLine.MarkHidden("ignore-flock")
 	pflag.Parse()
@@ -91,6 +93,7 @@ func main() {
 		sem      = semaphore.NewSemaphore(maxP)
 		workChan = make(chan work)
 		fileLock *flock.Flock
+		outLog   = log.New(os.Stderr, "", log.LstdFlags)
 
 		barTmpl = `{{ counters . }} {{ bar . }} {{ percent . }}`
 		barChan = make(chan int) // for the PB
@@ -115,6 +118,16 @@ func main() {
 			fmt.Println("Only one instance of ripfix should be running at a time.")
 			os.Exit(1)
 		}
+	}
+
+	// If we're logging to a file, check it out here.
+	if logFile != "" {
+		f, err := os.OpenFile(logFile, os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0600)
+		if err != nil {
+			fmt.Printf("Could not open logfile '%s' for append: %s\n", logFile, err)
+			os.Exit(1)
+		}
+		outLog = log.New(f, "", log.LstdFlags)
 	}
 
 	// Check for pdftoppm, tesseract, and possibly ps2pdf
@@ -162,17 +175,20 @@ func main() {
 		for p := range progressChan {
 			switch v := p.(type) {
 			case error:
-				log.Printf("[PROGRESS] ERROR: %s\n", v)
+				outLog.Printf("[PROGRESS] ERROR: %s\n", v)
 			case string:
 				if useBar {
 					if strings.Contains(v, "Completed Work!") {
 						barChan <- 1
 					}
+					if logFile != "" {
+						outLog.Printf("[PROGRESS] %s\n", v)
+					}
 				} else {
-					log.Printf("[PROGRESS] %s\n", v)
+					outLog.Printf("[PROGRESS] %s\n", v)
 				}
 			default:
-				log.Printf("[PROGRESS] ??: %+v\n", v)
+				outLog.Printf("[PROGRESS] ??: %+v\n", v)
 			}
 		}
 	}()
@@ -183,7 +199,6 @@ func main() {
 			bar := pb.ProgressBarTemplate(barTmpl).Start(totalGuess)
 			// bar.Set(pb.Bytes, true)
 			defer bar.Finish()
-			defer log.Println("The bar is too damn high!")
 
 			for b := range barChan {
 				bar.Add(b)
@@ -198,7 +213,7 @@ func main() {
 	}
 	for _, file := range files {
 		id := seq.NextHashID()
-		//log.Printf("[WORKFILE] %s is %s\n", file, id)
+		//outLog.Printf("[WORKFILE] %s is %s\n", file, id)
 		workChan <- work{
 			id:           id,
 			pdf:          file,

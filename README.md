@@ -21,10 +21,11 @@ go install github.com/cognusion/ripfix@latest
 
 ```bash
 Usage of ripfix:
-      --bar               Enable progress bar, suppress normal non-error screen logging.
+  -b, --bar               Enable progress bar, suppress normal non-error screen logging.
       --clean             Remove temp folders/files when complete. (default true)
   -c, --compress string   Set a compression target to one of 'none' (300DPI), 'ebook' (150DPI), or 'screen' (72DPI). (default "none")
       --flock string      Location of a file lock file, to ensure two copies of ripfix aren't running at the same time. (default "/tmp/ripfix.lock")
+  -l, --log string        If set, normal screen logging will go to the file instead, including when used with --bar.
   -m, --max int           Maximum number of simultaneous processors. (default 12)
   -o, --out string        Location to place the final products. They will have the same file name as the source. (default "./")
   -p, --pdfs strings      List of PDFs to convert. Globs are fine. Quotes are encouraged.
@@ -61,6 +62,9 @@ Location of a file that will be locked when an instance of **ripfix** is running
 
 While not strictly prohibitive if multiple instances of ripfix are running, they *must* all be running *clean==false* or they will clobber each other on the way out. This solves that.
 
+### log
+
+Location of a file to send the normal screen logging output to. The file will be appended to if it exists. The file will be created if it doesn't. The folder path should exist. If specified, this log will be written to even if --bar is used.
 
 ### max
 
