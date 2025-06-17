@@ -1,9 +1,7 @@
 package main
 
 import (
-	"errors"
 	"fmt"
-	"io/fs"
 	"log"
 	"os"
 	"os/exec"
@@ -129,8 +127,7 @@ func main() {
 			// Bingo!
 			defer fileLock.Unlock()
 		} else {
-			fmt.Println("Only one instance of ripfix should be running at a time.")
-			os.Exit(1)
+			die("Only one instance of ripfix should be running at a time.\n")
 		}
 	}
 
@@ -138,25 +135,21 @@ func main() {
 	if logFile != "" {
 		f, err := os.OpenFile(logFile, os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0600)
 		if err != nil {
-			fmt.Printf("Could not open logfile '%s' for append: %s\n", logFile, err)
-			os.Exit(1)
+			die("Could not open logfile '%s' for append: %s\n", logFile, err)
 		}
 		outLog = log.New(f, "", log.LstdFlags)
 	}
 
 	// Check for pdftoppm, tesseract, and possibly ps2pdf
 	if _, err := exec.LookPath("pdftoppm"); err != nil {
-		fmt.Println("Could not find path to pdftoppm!")
-		os.Exit(1)
+		die("Could not find path to pdftoppm!\n")
 	}
 	if _, err := exec.LookPath("tesseract"); err != nil {
-		fmt.Println("Could not find path to tesseract!")
-		os.Exit(1)
+		die("Could not find path to tesseract!\n")
 	}
 	if compress != "none" {
 		if _, err := exec.LookPath("ps2pdf"); err != nil {
-			fmt.Println("Could not find path to ps2pdf!")
-			os.Exit(1)
+			die("Could not find path to ps2pdf!\n")
 		}
 	}
 
@@ -164,8 +157,7 @@ func main() {
 	if s, serr := os.Stat(out); serr != nil {
 		panic(serr)
 	} else if !s.IsDir() {
-		fmt.Printf("Output location '%s' is not a directory.\n", out)
-		os.Exit(1)
+		die("Output location '%s' is not a directory.\n", out)
 	}
 
 	// Ensure the base tmp folder is available
@@ -362,20 +354,6 @@ func buildList(files []string, count chan int) []string {
 		count <- len(l)
 	}
 	return l
-}
-
-// fileExists returns true if a file exists, and false if it doesn't.
-func fileExists(file string) bool {
-	if _, err := os.Stat(file); errors.Is(err, fs.ErrNotExist) {
-		return false
-	}
-	return true
-}
-
-// simplerun is an abstraction to execute a Command.
-func simpleRun(name string, args ...string) error {
-	cmd := exec.Command(name, args...)
-	return cmd.Run()
 }
 
 // ripfix abstracts some clumsy code to get it out of the supervisor, and attach it to the work.
