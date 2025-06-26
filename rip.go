@@ -11,8 +11,8 @@ import (
 	"time"
 
 	"github.com/cheggaaa/pb/v3"
+	"github.com/cognusion/go-racket"
 	"github.com/cognusion/go-sequence"
-	"github.com/cognusion/semaphore"
 	"github.com/gofrs/flock"
 	"github.com/spf13/pflag"
 )
@@ -31,17 +31,6 @@ var (
 	useBar       bool
 	logFile      string
 )
-
-// work gets passed around to various funcs/goros.
-type work struct {
-	id           string
-	pdf          string
-	tmp          string
-	out          string
-	compress     string
-	skipExisting bool
-	clean        bool
-}
 
 func init() {
 	pflag.StringSliceVarP(&pdfs, "pdfs", "p", make([]string, 0), "List of PDFs to convert. Globs are fine. Quotes are encouraged.")
@@ -86,30 +75,36 @@ func init() {
 func main() {
 
 	var (
-		pid      = os.Getpid()
-		seq      = sequence.New(1)
-		sem      = semaphore.NewSemaphore(maxP)
-		workChan = make(chan work)
-		fileLock *flock.Flock
-		outLog   = log.New(os.Stderr, "", log.LstdFlags)
+		pid         = os.Getpid()
+		seq         = sequence.New(1)
+		workChan    = make(chan racket.Work)
+		fileLock    *flock.Flock
+		logMessages = true
+		outLog      = log.New(os.Stderr, "", log.LstdFlags)
 
 		barTmpl = `{{ counters . }} {{ bar . }} {{ percent . }}`
-		barChan chan int
+		barChan chan racket.Progress
 	)
 	if useBar {
-		barChan = make(chan int)
+		barChan = make(chan racket.Progress)
 		defer close(barChan)
+		logMessages = false // else gross
 
 		go func() {
-			totalGuess := <-barChan // first item is the anticipated number of steps
-			bar := pb.ProgressBarTemplate(barTmpl).Start(totalGuess)
+			bar := pb.ProgressBarTemplate(barTmpl).Start(len(pdfs))
 			// bar.Set(pb.Bytes, true)
 			defer bar.Finish()
 
 			for b := range barChan {
-				bar.Add(b)
+				switch b.Type {
+				case racket.ProgressUpdate:
+					bar.Add64(b.Data.(int64))
+				case racket.ProgressEstimate:
+					bar.SetTotal(b.Data.(int64))
+				}
 			}
 		}()
+		time.Sleep(100 * time.Millisecond)
 	}
 
 	// Step -1 Check and set
@@ -133,6 +128,7 @@ func main() {
 
 	// If we're logging to a file, check it out here.
 	if logFile != "" {
+		logMessages = true // in case of --bar, it is set false
 		f, err := os.OpenFile(logFile, os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0600)
 		if err != nil {
 			die("Could not open logfile '%s' for append: %s\n", logFile, err)
@@ -169,170 +165,175 @@ func main() {
 	}
 
 	// Oy! No printing other than to logs from this point!
+	//outLog.Printf("RipFix job starting...\n")
 
 	// Step 0 workers
 	// We are ok with starting too many workers, as any unneeded will just exit
 	// after the work is assigned.
-	progressChan, doneChan := supervisor(&sem, workChan)
+	rfJob := racket.NewJob(ripFixWorkFunc)
+	progressChan, doneFunc := rfJob.Supervisor(maxP, workChan)
 	defer close(progressChan)
 
-	// read from progressChan and print stuff
-	go func() {
-		for p := range progressChan {
-			switch v := p.(type) {
-			case error:
-				// Always print errors.
-				outLog.Printf("[PROGRESS] ERROR: %s\n", v)
-			case string:
-				if logFile != "" {
-					// Always print if we're logging.
-					outLog.Printf("[PROGRESS] %s\n", v)
-				}
+	//outLog.Printf("\tSupervisor running...\n")
 
-				if useBar {
-					if strings.Contains(v, "Completed Work!") {
-						barChan <- 1
-					}
-				} else if logFile == "" {
-					// If we are not using the bar, and not logging, print.
-					outLog.Printf("[PROGRESS] %s\n", v)
-				}
-			default:
-				// Always print weird shit.
-				outLog.Printf("[PROGRESS] ??: %+v\n", v)
-			}
-		}
-	}()
+	go racket.ProgressLogger(outLog, logMessages, nil, progressChan, barChan)
+
+	//outLog.Printf("\tProcessLogger running...\n")
 
 	// Step 1 build work and dole it out
 	for _, file := range buildList(pdfs, barChan) {
 		id := seq.NextHashID()
 		//outLog.Printf("[WORKFILE] %s is %s\n", file, id)
-		workChan <- work{
-			id:           id,
-			pdf:          file,
-			tmp:          fmt.Sprintf("%s%s/%d.%s/", tmp, tmpFolder, pid, id),
-			out:          out,
-			compress:     compress,
-			skipExisting: skipExisting,
-			clean:        clean,
-		}
+		workChan <- racket.NewWork(map[string]any{
+			"id":           id,
+			"pdf":          file,
+			"temp":         fmt.Sprintf("%s%s/%d.%s/", tmp, tmpFolder, pid, id),
+			"out":          out,
+			"compress":     compress,
+			"skipExisting": skipExisting,
+			"clean":        clean,
+		})
 	}
 	// POST: each work{} has been consumed by a worker.
 
 	// Signal we're done, so any idle workers can exit
-	close(doneChan)
+	doneFunc()
+	//outLog.Printf("\tDone sending work. Waiting...\n")
 
 	// wait until all of the workers are done
-	<-sem.IsFree(100 * time.Millisecond)
+	<-rfJob.IsDone()
+	//outLog.Printf("\tJob is done!\n")
 }
 
-// supervisor takes a Semaphore and a channel where work will be assigned, immediately returning two channels:
-//
-//	The first channel (progressChan) is where progress updates (string) an errors (error) are sent. If an error is sent, the worker will exit.
-//	The second channel (doneChan) is used to signal the supervisor and workers when there will be no more work assigned, via closing.
-//
-// The supervisor ensures that there are always 'maxP' workers waiting (using the Semaphore), listening for work, until doneChan is closed.
-// Each worker does *at most one* item of work, exiting when it is complete. The supervisor will start a new worker if it is still employed.
-func supervisor(lock *semaphore.Semaphore, workChan chan work) (progressChan chan any, doneChan chan struct{}) {
-	doneChan = make(chan struct{})
-	progressChan = make(chan any)
+// ripFixWorkFunc is a racket.WorkerFunc that will get handed Work by the Supervisor.
+func ripFixWorkFunc(id any, w racket.Work, progressChan chan<- racket.Progress) {
+	// Got work
+	var err error
+	progressChan <- racket.PMessagef("[WORKER %v] Work! %+v", id, w)
 
-	go func() {
-		c := 0
-		for {
-			c++
-			select {
-			case <-lock.Until():
-				// woo! make a worker!
-				go func(i int) {
-					progressChan <- fmt.Sprintf("[WORKER %d] Start", i)
-					defer lock.Unlock()
-					defer func() { progressChan <- fmt.Sprintf("[WORKER %d] Done", i) }()
+	// Ensure path
+	err = os.MkdirAll(w.GetString("temp"), os.ModePerm)
+	if err != nil {
+		progressChan <- racket.PErrorf("[WORKER %v] Error MkdirAll '%s': %w", id, w.GetString("temp"), err)
+		return
+	}
+	if w.GetBool("clean") {
+		// These temp folder full of TIFFs can get massive.
+		// Clean up.
+		defer os.RemoveAll(w.GetString("temp"))
+	}
 
-					select {
-					case w := <-workChan:
-						// Step 2 get work
-						var err error
-						progressChan <- fmt.Sprintf("[WORKER %d] Work! %+v", i, w)
+	// Craft the future file names, and see if the compressed product exists for an early exit.
+	outFile := fmt.Sprintf("%s%s_fixed", w.GetString("out"), strings.TrimSuffix(filepath.Base(w.GetString("pdf")), filepath.Ext(filepath.Base(w.GetString("pdf"))))) // tesseract wants an extensionless filename
+	compressFile := fmt.Sprintf("%s_%s.pdf", outFile, w.GetString("compress"))
+	if w.GetString("compress") != "none" && w.GetBool("skipExisting") && fileExists(compressFile) {
+		// There is no need to craft _fixed if _fixed_[compress] exists.
+		progressChan <- racket.PMessagef("[WORKER %v] Compress file '%s' already exists. Completed Work! Skipping all the things!", id, compressFile)
+		progressChan <- racket.PUpdate(1)
+		return
+	}
 
-						// Step 3a ensure path
-						err = os.MkdirAll(w.tmp, os.ModePerm)
-						if err != nil {
-							progressChan <- fmt.Errorf("[WORKER %d] Error MkdirAll '%s': %w", i, w.tmp, err)
-							return
-						}
-						if w.clean {
-							// These temp folder full of TIFFs can get massive.
-							// Clean up.
-							defer os.RemoveAll(w.tmp)
-						}
+	// Rip PDFs into TIFFs,
+	// OCR the TIFFs,
+	// and fix them into PDFs again
+	if !(w.GetBool("skipExisting") && fileExists(outFile+".pdf")) {
+		progressChan <- racket.PMessagef("[WORKER %v] pdfToTiff(%s, %s)", id, w.GetString("pdf"), w.GetString("temp"))
 
-						// Step 3b craft the future file names, and see if the compressed product exists for an early exit.
-						outFile := fmt.Sprintf("%s%s_fixed", w.out, strings.TrimSuffix(filepath.Base(w.pdf), filepath.Ext(filepath.Base(w.pdf)))) // tesseract wants an extensionless filename
-						compressFile := fmt.Sprintf("%s_%s.pdf", outFile, w.compress)
-						if w.compress != "none" && w.skipExisting && fileExists(compressFile) {
-							// There is no need to craft _fixed if _fixed_[compress] exists.
-							progressChan <- fmt.Sprintf("[WORKER %d] Compress file '%s' already exists. Completed Work! Skipping all the things!", i, compressFile)
-							return
-						}
+		err = ripfix(id, w, progressChan)
+		if err != nil {
+			progressChan <- racket.PErrorf("[WORKER %v] Error: %w", id, err)
+			return
+		}
+	} else {
+		progressChan <- racket.PMessagef("[WORKER %v] %s.pdf found, skipping pdfToTiff and tesseract", id, outFile)
+	}
+	productFile := outFile + ".pdf"
 
-						// Step 4 rip PDFs into TIFFs
-						// Step 5 OCR the TIFFs and fix them into PDFs again
-						if !(w.skipExisting && fileExists(outFile+".pdf")) {
-							progressChan <- fmt.Sprintf("[WORKER %d] pdfToTiff(%s, %s)", i, w.pdf, w.tmp)
-
-							err = w.ripfix(i, progressChan)
-							if err != nil {
-								progressChan <- fmt.Errorf("[WORKER %d] Error: %w", i, err)
-								return
-							}
-						} else {
-							progressChan <- fmt.Sprintf("[WORKER %d] %s.pdf found, skipping pdfToTiff and tesseract", i, outFile)
-						}
-						productFile := outFile + ".pdf"
-
-						// Step 6 maybe compress the images in the PDF
-						if w.compress != "none" {
-							nOutFile := outFile + ".pdf"
-							if !(w.skipExisting && fileExists(compressFile)) {
-								progressChan <- fmt.Sprintf("[WORKER %d] compressPdf(%s, %s, %s)", i, w.compress, nOutFile, compressFile)
-								err = compressPdf(w.compress, nOutFile, compressFile)
-								if err != nil {
-									progressChan <- fmt.Errorf("[WORKER %d] Error compressPdf '%s' '%s' -> '%s': %w", i, w.compress, nOutFile, compressFile, err)
-									return
-								}
-							} else {
-								progressChan <- fmt.Sprintf("[WORKER %d] %s found, skipping compressPdf", i, compressFile)
-							}
-							productFile = compressFile // update
-							if w.clean {
-								// We are conflicted about this, as it took a lot of work to make that file, and if we don't like the compressed version,
-								// we may want to recompress it using a different setting "manually", but also understand why we're doing this, as 1G PDFs
-								// are better as 200MB PDFs, not 1200MBs of PDFs :)
-								defer os.Remove(nOutFile)
-							}
-						}
-
-						// Step N celebrate!
-						progressChan <- fmt.Sprintf("[WORKER %d] Completed Work! See '%s'", i, productFile)
-					case <-doneChan:
-						// That's all folks!
-						return
-					}
-				}(c)
-			case <-doneChan:
-				// That's all folks!
+	// Maybe compress the images in the PDF
+	if w.GetString("compress") != "none" {
+		nOutFile := outFile + ".pdf"
+		if !(w.GetBool("skipExisting") && fileExists(compressFile)) {
+			progressChan <- racket.PMessagef("[WORKER %v] compressPdf(%s, %s, %s)", id, w.GetString("compress"), nOutFile, compressFile)
+			err = compressPdf(w.GetString("compress"), nOutFile, compressFile)
+			if err != nil {
+				progressChan <- racket.PErrorf("[WORKER %v] Error compressPdf '%s' '%s' -> '%s': %w", id, w.GetString("compress"), nOutFile, compressFile, err)
 				return
 			}
+		} else {
+			progressChan <- racket.PMessagef("[WORKER %v] %s found, skipping compressPdf", id, compressFile)
 		}
-	}()
+		productFile = compressFile // update
+		if w.GetBool("clean") {
+			// We are conflicted about this, as it took a lot of work to make that file, and if we don't like the compressed version,
+			// we may want to recompress it using a different setting "manually", but also understand why we're doing this, as 1G PDFs
+			// are better as 200MB PDFs, not 1200MBs of PDFs :)
+			defer os.Remove(nOutFile)
+		}
+	}
 
-	return // progressChan, doneChan
+	// Step N celebrate!
+	progressChan <- racket.PMessagef("[WORKER %v] Completed Work! See '%s'", id, productFile)
+	progressChan <- racket.PUpdate(1)
+}
+
+// ripfix is an abstraction to get these steps out of ripFixWorkFunc so it is easier to skip them if needed.
+func ripfix(workerID any, w racket.Work, progressChan chan<- racket.Progress) error {
+	var (
+		err     error
+		outFile = fmt.Sprintf("%s%s_fixed", w.GetString("out"), strings.TrimSuffix(filepath.Base(w.GetString("pdf")), filepath.Ext(filepath.Base(w.GetString("pdf"))))) // tesseract wants an extensionless filename
+	)
+
+	// Step 4a rip the PDF into TIFFs
+	err = pdfToTiff(w.GetString("pdf"), w.GetString("temp"))
+	if err != nil {
+		return fmt.Errorf("pdftoppm '%s' -> '%s': %w", w.GetString("pdf"), w.GetString("temp"), err)
+	}
+	// Step 4b create list of result files, w.GetString("temp")+w.GetString("id")+".lst"
+	progressChan <- racket.PMessagef("[WORKER %v] createTiffList", workerID)
+
+	listFile, lErr := createTiffList(w)
+	if lErr != nil {
+		return fmt.Errorf("createTiffList: %w", lErr)
+	}
+
+	// Step 5 tesseract the TIFFs
+	progressChan <- racket.PMessagef("[WORKER %v] tesseract(%s, %s)", workerID, listFile, outFile)
+	err = tesseract(listFile, outFile)
+	if err != nil {
+		return fmt.Errorf("tesseract '%s' -> '%s': %w", w.GetString("temp"), outFile, err)
+	}
+
+	return nil
+}
+
+// createTiffList assembles a list of -presumably- the TIFF images created by pdfToTiff,
+// writing it to a file that tesseract can read.
+func createTiffList(w racket.Work) (string, error) {
+	var (
+		gfiles []string
+		f      *os.File
+		err    error
+	)
+	listFile := fmt.Sprintf("%s%s.lst", w.GetString("temp"), w.GetString("id"))
+	gfiles, err = filepath.Glob(w.GetString("temp") + "*.tif")
+	if err != nil {
+		return "", fmt.Errorf("error getting tiffs '%s': %w", w.GetString("temp"), err)
+	}
+	f, err = os.Create(listFile)
+	if err != nil {
+		return "", fmt.Errorf("error creating list file '%s': %w", listFile, err)
+	}
+	defer f.Close()
+	for _, line := range gfiles {
+		if _, werr := f.WriteString(line + "\n"); werr != nil {
+			return "", fmt.Errorf("error writing to '%s': %w", listFile, err)
+		}
+	}
+	return listFile, nil
 }
 
 // buildList will possibly recursively (if a glob is provided) create a list of files to assign as work.
-func buildList(files []string, count chan int) []string {
+func buildList(files []string, count chan racket.Progress) []string {
 	l := make([]string, 0)
 	for _, file := range files {
 		//fmt.Printf("[FILE] %s\n", file)
@@ -351,66 +352,9 @@ func buildList(files []string, count chan int) []string {
 		}
 	}
 	if count != nil {
-		count <- len(l)
+		count <- racket.PEstimate(int64(len(l)))
 	}
 	return l
-}
-
-// ripfix abstracts some clumsy code to get it out of the supervisor, and attach it to the work.
-// The next generation will put all of the code on the work so the supervisor can just handle errors and keep the workers working.
-func (w *work) ripfix(i int, progressChan chan any) error {
-	var (
-		err     error
-		outFile = fmt.Sprintf("%s%s_fixed", w.out, strings.TrimSuffix(filepath.Base(w.pdf), filepath.Ext(filepath.Base(w.pdf)))) // tesseract wants an extensionless filename
-	)
-
-	// Step 4a rip the PDF into TIFFs
-	err = pdfToTiff(w.pdf, w.tmp)
-	if err != nil {
-		return fmt.Errorf("pdftoppm '%s' -> '%s': %w", w.pdf, w.tmp, err)
-	}
-	// Step 4b create list of result files, w.tmp+w.id+".lst"
-	progressChan <- fmt.Sprintf("[WORKER %d] createTiffList", i)
-
-	listFile, lErr := w.createTiffList()
-	if lErr != nil {
-		return fmt.Errorf("createTiffList: %w", lErr)
-	}
-
-	// Step 5 tesseract the TIFFs
-	progressChan <- fmt.Sprintf("[WORKER %d] tesseract(%s, %s)", i, listFile, outFile)
-	err = tesseract(listFile, outFile)
-	if err != nil {
-		return fmt.Errorf("tesseract '%s' -> '%s': %w", w.tmp, outFile, err)
-	}
-
-	return nil
-}
-
-// createTiffList assembles a list of -presumably- the TIFF images created by pdfToTiff,
-// writing it to a file that tesseract can read.
-func (w *work) createTiffList() (string, error) {
-	var (
-		gfiles []string
-		f      *os.File
-		err    error
-	)
-	listFile := fmt.Sprintf("%s%s.lst", w.tmp, w.id)
-	gfiles, err = filepath.Glob(w.tmp + "*.tif")
-	if err != nil {
-		return "", fmt.Errorf("error getting tiffs '%s': %w", w.tmp, err)
-	}
-	f, err = os.Create(listFile)
-	if err != nil {
-		return "", fmt.Errorf("error creating list file '%s': %w", listFile, err)
-	}
-	defer f.Close()
-	for _, line := range gfiles {
-		if _, werr := f.WriteString(line + "\n"); werr != nil {
-			return "", fmt.Errorf("error writing to '%s': %w", listFile, err)
-		}
-	}
-	return listFile, nil
 }
 
 // pdfToTiff constructs a pdftoppm Command to extract PDF pages as TIFF images.
