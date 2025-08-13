@@ -5,6 +5,7 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -129,7 +130,7 @@ func main() {
 	// If we're logging to a file, check it out here.
 	if logFile != "" {
 		logMessages = true // in case of --bar, it is set false
-		f, err := os.OpenFile(logFile, os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0600)
+		f, err := os.OpenFile(path.Clean(logFile), os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0600)
 		if err != nil {
 			die("Could not open logfile '%s' for append: %s\n", logFile, err)
 		}
@@ -157,7 +158,7 @@ func main() {
 	}
 
 	// Ensure the base tmp folder is available
-	if terr := os.MkdirAll(tmp+tmpFolder, os.ModePerm); terr != nil {
+	if terr := os.MkdirAll(tmp+tmpFolder, 0550); terr != nil {
 		panic(terr)
 	}
 	if clean {
@@ -212,7 +213,7 @@ func ripFixWorkFunc(id any, w racket.Work, progressChan chan<- racket.Progress) 
 	progressChan <- racket.PMessagef("[WORKER %v] Work! %+v", id, w)
 
 	// Ensure path
-	err = os.MkdirAll(w.GetString("temp"), os.ModePerm)
+	err = os.MkdirAll(w.GetString("temp"), 0550)
 	if err != nil {
 		progressChan <- racket.PErrorf("[WORKER %v] Error MkdirAll '%s': %w", id, w.GetString("temp"), err)
 		return
@@ -319,7 +320,7 @@ func createTiffList(w racket.Work) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("error getting tiffs '%s': %w", w.GetString("temp"), err)
 	}
-	f, err = os.Create(listFile)
+	f, err = os.Create(path.Clean(listFile))
 	if err != nil {
 		return "", fmt.Errorf("error creating list file '%s': %w", listFile, err)
 	}
