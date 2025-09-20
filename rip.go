@@ -41,6 +41,8 @@ var (
 	debug        bool
 	dupes        bool
 	dupeMap      sync.Map
+
+	debugLog = log.New(io.Discard, "", 0)
 )
 
 func init() {
@@ -102,7 +104,6 @@ func main() {
 		fileLock    *flock.Flock
 		logMessages = true
 		outLog      = log.New(os.Stderr, "", log.LstdFlags)
-		debugLog    = log.New(io.Discard, "", 0)
 		barTmpl     = `{{ counters . }} {{ bar . }} {{ percent . }}`
 		barChan     chan racket.Progress
 	)
@@ -330,7 +331,7 @@ func resolveDupes(id any, basePDF string, productFile *string, progressChan chan
 	// Dupe detection!
 	h, e := calculateSHA256Sum(basePDF)
 	if e != nil {
-		panic(e)
+		panic(fmt.Errorf("error calulating SHA256sum of '%s' : %w", basePDF, e))
 	}
 
 	base := strings.TrimSuffix(basePDF, filepath.Ext(basePDF))
@@ -362,7 +363,7 @@ func resolveDupes(id any, basePDF string, productFile *string, progressChan chan
 			progressChan <- racket.PMessagef("[WORKER %v] Post-process dupe copy of '%s' to '%s' for %s'", id, *productFile, pf, f)
 			_, e := copyFile(*productFile, pf)
 			if e != nil {
-				panic(e)
+				panic(fmt.Errorf("error copying '%s' to '%s' : %w", *productFile, pf, e))
 			}
 		}
 
@@ -448,12 +449,12 @@ func buildList(files []string, count chan racket.Progress, progressChan chan<- r
 			if dupes {
 				h, e := calculateSHA256Sum(file)
 				if e != nil {
-					panic(e)
+					panic(fmt.Errorf("error calulating SHA256sum of '%s' : %w", file, e))
 				}
 				v, loaded := dupeMap.LoadOrStore(h, file)
 				if loaded {
 					// DUPE! We aren't handling those yet
-					progressChan <- racket.PMessagef("[BUILDLIST] DUPE! File '%+v' and '%s' share a sum (%s)!", v, file, h)
+					progressChan <- racket.PMessagef("[BUILDLIST] DUPE! Files '%+v' and '%s' share a sum (%s)!", v, file, h)
 					var ns []string
 					switch t := v.(type) {
 					case string:
