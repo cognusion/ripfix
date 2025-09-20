@@ -24,6 +24,8 @@ Usage of ripfix:
   -b, --bar               Enable progress bar, suppress normal non-error screen logging.
       --clean             Remove temp folders/files when complete. (default true)
   -c, --compress string   Set a compression target to one of 'none' (300DPI), 'ebook' (150DPI), or 'screen' (72DPI). (default "none")
+      --debug             Enables debug logging. Disables bar.
+      --dupes             Enables deduplication. Ever file processed gets a sha256 hash, and if a dupe is found, the previous result is copied.
       --flock string      Location of a file lock file, to ensure two copies of ripfix aren't running at the same time. (default "/tmp/ripfix.lock")
   -l, --log string        If set, normal screen logging will go to the file instead, including when used with --bar.
   -m, --max int           Maximum number of simultaneous processors. (default 12)
@@ -55,6 +57,18 @@ If this value not *none*, after **ripfix** generates a *_fixed* PDF, it will run
 
 Of note, if *clean* is true, the *_fixed* PDF will be removed after the compressed version of *_fixed_[style]* is finished.
 
+### debug
+
+*default: false*
+
+Enables vociferous output, disables *--bar*.
+
+### dupes
+
+*default: false*
+
+Creates a SHA256 sum for each file processed, and checks it against the list of sums. If there is a collision, subsequent files are given copies of the resulting product immediately after the product is completed.
+
 ### flock
 
 *default: [OS-reported temp location]/ripfix.lock*
@@ -62,6 +76,8 @@ Of note, if *clean* is true, the *_fixed* PDF will be removed after the compress
 Location of a file that will be locked when an instance of **ripfix** is running. If another is started up it will be unable to lock the file and return an appropriate message whilst exiting.
 
 While not strictly prohibitive if multiple instances of ripfix are running, they *must* all be running *clean==false* or they will clobber each other on the way out. This solves that.
+
+The ***hidden*** option *--ignore-flock* does exist, but should never be used unless you really really understand what you're doing, and need to run multiple **ripfix** instances concurrently, and really really understand what you're doing.
 
 ### log
 
@@ -82,6 +98,14 @@ This is where the fixed PDFs will end up.
 ### pdfs
 
 All the PDFs you want to work on. Globs liked "*.pdf" are valid (note the quotes). They will end up in *--out* named the same with *_fixed* appended. (e.g. *neat.pdf* will be *neat_fixed.pdf*)
+
+### reprocess
+
+*default: false*
+
+If enabled, sets *--skip* to false. The only files that will be processed, will be those that have a matching *_fixed* or *_fixed_[compress style]* version. T
+
+This is most useful for large sets of already-processed files, where there are deliberate holes (e.g. some PDFs are already texty, so didn't need a fix to begin with), but because of changes, only those need reprocessing (e.g. newer/better **tesseract**, or better option strings, etc.).
 
 ### skip
 

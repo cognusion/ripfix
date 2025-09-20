@@ -59,11 +59,9 @@ func init() {
 	pflag.BoolVarP(&useBar, "bar", "b", false, "Enable progress bar, suppress normal non-error screen logging.")
 	pflag.StringVarP(&logFile, "log", "l", "", "If set, normal screen logging will go to the file instead, including when used with --bar.")
 	pflag.BoolVar(&debug, "debug", false, "Enables debug logging. Disables bar.")
-	pflag.BoolVar(&dupes, "dupes", false, "Enables deduplication. Ever file processed gets a sha256 hash, and if a dupe is found, the previous result is copied.")
+	pflag.BoolVar(&dupes, "dupes", false, "Enables deduplication. Every file processed gets a sha256 hash, and if a dupe is found the subsequents are skipped.")
 
 	pflag.CommandLine.MarkHidden("ignore-flock")
-	pflag.CommandLine.MarkHidden("debug")
-	pflag.CommandLine.MarkHidden("dupes") // for now
 	pflag.Parse()
 
 	if len(pdfs) == 0 {
@@ -211,7 +209,7 @@ func main() {
 	debugLog.Printf("\tProcessLogger running...\n")
 
 	// Step 1 build work and dole it out
-	for _, file := range buildList(pdfs, barChan) {
+	for _, file := range buildList(pdfs, barChan, progressChan) {
 		id := seq.NextHashID()
 		//outLog.Printf("[WORKFILE] %s is %s\n", file, id)
 		workChan <- racket.NewWork(map[string]any{
@@ -223,6 +221,7 @@ func main() {
 			"skipExisting": skipExisting,
 			"reprocess":    reprocess,
 			"clean":        clean,
+			"dupes":        dupes,
 		})
 	}
 	// POST: each work{} has been consumed by a worker.
@@ -239,8 +238,16 @@ func main() {
 // ripFixWorkFunc is a racket.WorkerFunc that will get handed Work by the Supervisor.
 func ripFixWorkFunc(id any, w racket.Work, progressChan chan<- racket.Progress) {
 	// Got work
-	var err error
+	var (
+		err         error
+		productFile string
+	)
+
 	progressChan <- racket.PMessagef("[WORKER %v] Work! %+v", id, w)
+
+	if w.GetBool("dupes") {
+		defer resolveDupes(id, w.GetString("pdf"), &productFile, progressChan)
+	}
 
 	// Ensure path
 	err = os.MkdirAll(w.GetString("temp"), 0750)
@@ -257,6 +264,14 @@ func ripFixWorkFunc(id any, w racket.Work, progressChan chan<- racket.Progress) 
 	// Craft the future file names, and see if the compressed product exists for an early exit.
 	outFile := fmt.Sprintf("%s%s%s", w.GetString("out"), strings.TrimSuffix(filepath.Base(w.GetString("pdf")), filepath.Ext(filepath.Base(w.GetString("pdf")))), suffixFixed) // tesseract wants an extensionless filename
 	compressFile := fmt.Sprintf("%s_%s.pdf", outFile, w.GetString("compress"))
+
+	// Set productFile, so we know what the result will be early.
+	if w.GetString("compress") != "none" {
+		productFile = compressFile
+	} else {
+		productFile = outFile + ".pdf"
+	}
+
 	if w.GetBool("reprocess") && !(fileExists(outFile) || fileExists(compressFile)) {
 		// There is no need to process this file, as there is not a fixed variant existing.
 		progressChan <- racket.PMessagef("[WORKER %v] Reprocessing '%s' unneeded, as no fixed variant exists. Completed Work! Skipping all the things!", id, w.GetString("pdf"))
@@ -285,7 +300,6 @@ func ripFixWorkFunc(id any, w racket.Work, progressChan chan<- racket.Progress) 
 	} else {
 		progressChan <- racket.PMessagef("[WORKER %v] %s.pdf found, skipping pdfToTiff and tesseract", id, outFile)
 	}
-	productFile := outFile + ".pdf"
 
 	// Maybe compress the images in the PDF
 	if w.GetString("compress") != "none" {
@@ -300,7 +314,6 @@ func ripFixWorkFunc(id any, w racket.Work, progressChan chan<- racket.Progress) 
 		} else {
 			progressChan <- racket.PMessagef("[WORKER %v] %s found, skipping compressPdf", id, compressFile)
 		}
-		productFile = compressFile // update
 		if w.GetBool("clean") {
 			// We are conflicted about this, as it took a lot of work to make that file, and if we don't like the compressed version,
 			// we may want to recompress it using a different setting "manually", but also understand why we're doing this, as 1G PDFs
@@ -312,6 +325,50 @@ func ripFixWorkFunc(id any, w racket.Work, progressChan chan<- racket.Progress) 
 	// Step N celebrate!
 	progressChan <- racket.PMessagef("[WORKER %v] Completed Work! See '%s'", id, productFile)
 	progressChan <- racket.PUpdate(1)
+}
+
+// resolveDupes goes through the tedium of determining what -if any- copies need to occur because of duplicate files.
+func resolveDupes(id any, basePDF string, productFile *string, progressChan chan<- racket.Progress) {
+	// Dupe detection!
+	h, e := calculateSHA256Sum(basePDF)
+	if e != nil {
+		panic(e)
+	}
+
+	base := strings.TrimSuffix(basePDF, filepath.Ext(basePDF))
+
+	v, ok := dupeMap.Load(h)
+	if ok {
+		// There are dupes!
+		var ns []string
+		switch t := v.(type) {
+		case string:
+			// one
+			ns = []string{t}
+		case []string:
+			// more
+			ns = t
+		}
+		for _, f := range ns {
+			// copies!
+			if f == basePDF {
+				continue
+			}
+			baseF := strings.TrimSuffix(f, filepath.Ext(f))
+			pf := strings.Replace(*productFile, base, baseF, 1)
+			if skipExisting && fileExists(pf) {
+				// exists, and we are skipping, so skip it.
+				progressChan <- racket.PMessagef("[WORKER %v] Post-process dupe copy of '%s' to '%s' for %s' skipped, as it exists!", id, *productFile, pf, f)
+				continue
+			}
+			progressChan <- racket.PMessagef("[WORKER %v] Post-process dupe copy of '%s' to '%s' for %s'", id, *productFile, pf, f)
+			_, e := copyFile(*productFile, pf)
+			if e != nil {
+				panic(e)
+			}
+		}
+
+	}
 }
 
 // ripfix is an abstraction to get these steps out of ripFixWorkFunc so it is easier to skip them if needed.
@@ -371,7 +428,7 @@ func createTiffList(w racket.Work) (string, error) {
 }
 
 // buildList will possibly recursively (if a glob is provided) create a list of files to assign as work.
-func buildList(files []string, count chan racket.Progress) []string {
+func buildList(files []string, count chan racket.Progress, progressChan chan<- racket.Progress) []string {
 	l := make([]string, 0)
 	for _, file := range files {
 		//fmt.Printf("[FILE] %s\n", file)
@@ -384,7 +441,7 @@ func buildList(files []string, count chan racket.Progress) []string {
 			if err != nil {
 				panic(err)
 			}
-			l = append(l, buildList(gfiles, nil)...) // recursion, but don't send the chan!
+			l = append(l, buildList(gfiles, nil, progressChan)...) // recursion, but don't send the chan!
 		} else if s, err := os.Stat(file); err != nil {
 			// We we can't stat the thing, something is very wrong.
 			panic(fmt.Errorf("file %s cannot be found: %w", file, err))
@@ -398,7 +455,19 @@ func buildList(files []string, count chan racket.Progress) []string {
 				v, loaded := dupeMap.LoadOrStore(h, file)
 				if loaded {
 					// DUPE! We aren't handling those yet
-					panic(fmt.Errorf("DUPE! File '%s' and '%s' share a sum", v, file))
+					progressChan <- racket.PMessagef("[BUILDLIST] DUPE! File '%+v' and '%s' share a sum (%s)!", v, file, h)
+					var ns []string
+					switch t := v.(type) {
+					case string:
+						ns = []string{
+							t,
+							file,
+						}
+					case []string:
+						ns = append(t, file)
+					}
+					dupeMap.Store(h, ns)
+					continue
 				}
 			}
 			l = append(l, file)
@@ -428,6 +497,37 @@ func calculateSHA256Sum(filePath string) (string, error) {
 
 	// Get the final hash sum and encode it to a hexadecimal string
 	return hex.EncodeToString(hash.Sum(nil)), nil
+}
+
+// copyFile ... copies a file.
+func copyFile(src, dst string) (int64, error) {
+	//#nosec G304 - Open the source file for reading
+	sourceFile, err := os.Open(src)
+	if err != nil {
+		return 0, err
+	}
+	defer sourceFile.Close() // Ensure the source file is closed
+
+	// Get file info to preserve permissions
+	sourceFileInfo, err := sourceFile.Stat()
+	if err != nil {
+		return 0, err
+	}
+
+	//#nosec G304 - Create the destination file with the same permissions as the source
+	destinationFile, err := os.OpenFile(dst, os.O_RDWR|os.O_CREATE|os.O_TRUNC, sourceFileInfo.Mode())
+	if err != nil {
+		return 0, err
+	}
+	defer destinationFile.Close() // Ensure the destination file is closed
+
+	// Copy the contents from source to destination
+	bytesCopied, err := io.Copy(destinationFile, sourceFile)
+	if err != nil {
+		return 0, err
+	}
+
+	return bytesCopied, nil
 }
 
 // pdfToTiff constructs a pdftoppm Command to extract PDF pages as TIFF images.
