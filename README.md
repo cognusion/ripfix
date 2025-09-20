@@ -29,6 +29,7 @@ Usage of ripfix:
   -m, --max int           Maximum number of simultaneous processors. (default 12)
   -o, --out string        Location to place the final products. They will have the same file name as the source. (default "./")
   -p, --pdfs strings      List of PDFs to convert. Globs are fine. Quotes are encouraged.
+      --reprocess         ONLY reprocess PDFs that have existing suffixes. Disables 'skip'. Use with care.
       --skip              If a suffixed file is encountered, assume it is correct and don't do that part of the process again. (default true)
   -t, --temp string       Location for temp files. (default "/tmp/")
 ```

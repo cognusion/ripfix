@@ -1,7 +1,10 @@
 package main
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/exec"
@@ -18,6 +21,10 @@ import (
 	"github.com/spf13/pflag"
 )
 
+const (
+	suffixFixed string = "_fixed"
+)
+
 var (
 	pdfs         []string
 	maxP         int
@@ -26,11 +33,14 @@ var (
 	tmpFolder    = "ripfix"
 	compress     string
 	skipExisting bool
+	reprocess    bool
 	clean        bool
 	flockFile    string
 	skipFlock    bool
 	useBar       bool
 	logFile      string
+	debug        bool
+	dupes        bool
 )
 
 func init() {
@@ -41,12 +51,17 @@ func init() {
 	pflag.BoolVar(&clean, "clean", true, "Remove temp folders/files when complete.")
 	pflag.StringVarP(&compress, "compress", "c", "none", "Set a compression target to one of 'none' (300DPI), 'ebook' (150DPI), or 'screen' (72DPI).")
 	pflag.BoolVar(&skipExisting, "skip", true, "If a suffixed file is encountered, assume it is correct and don't do that part of the process again.")
+	pflag.BoolVar(&reprocess, "reprocess", false, "ONLY reprocess PDFs that have existing suffixes. Disables 'skip'. Use with care.")
 	pflag.StringVar(&flockFile, "flock", os.TempDir()+"/ripfix.lock", "Location of a file lock file, to ensure two copies of ripfix aren't running at the same time.")
 	pflag.BoolVar(&skipFlock, "ignore-flock", false, "DANGER: If true, skips flocking.")
 	pflag.BoolVarP(&useBar, "bar", "b", false, "Enable progress bar, suppress normal non-error screen logging.")
 	pflag.StringVarP(&logFile, "log", "l", "", "If set, normal screen logging will go to the file instead, including when used with --bar.")
+	pflag.BoolVar(&debug, "debug", false, "Enables debug logging. Disables bar.")
+	pflag.BoolVar(&dupes, "dupes", false, "Enables deduplication. Ever file processed gets a sha256 hash, and if a dupe is found, the previous result is copied.")
 
 	pflag.CommandLine.MarkHidden("ignore-flock")
+	pflag.CommandLine.MarkHidden("debug")
+	pflag.CommandLine.MarkHidden("dupes") // for now
 	pflag.Parse()
 
 	if len(pdfs) == 0 {
@@ -56,6 +71,13 @@ func init() {
 	}
 
 	// Sanity!
+	if debug {
+		useBar = false
+	}
+	if reprocess {
+		// reprocess overrides the skip
+		skipExisting = false
+	}
 	if maxP < 1 {
 		// We need at least one processor, or deadlock
 		maxP = 1
@@ -82,10 +104,15 @@ func main() {
 		fileLock    *flock.Flock
 		logMessages = true
 		outLog      = log.New(os.Stderr, "", log.LstdFlags)
-
-		barTmpl = `{{ counters . }} {{ bar . }} {{ percent . }}`
-		barChan chan racket.Progress
+		debugLog    = log.New(io.Discard, "", 0)
+		barTmpl     = `{{ counters . }} {{ bar . }} {{ percent . }}`
+		barChan     chan racket.Progress
 	)
+
+	if debug {
+		debugLog = log.New(os.Stderr, "[DEBUG] ", log.Lshortfile)
+	}
+
 	if useBar {
 		barChan = make(chan racket.Progress)
 		defer close(barChan)
@@ -158,7 +185,7 @@ func main() {
 	}
 
 	// Ensure the base tmp folder is available
-	if terr := os.MkdirAll(tmp+tmpFolder, 0550); terr != nil {
+	if terr := os.MkdirAll(tmp+tmpFolder, 0750); terr != nil {
 		panic(terr)
 	}
 	if clean {
@@ -166,7 +193,7 @@ func main() {
 	}
 
 	// Oy! No printing other than to logs from this point!
-	//outLog.Printf("RipFix job starting...\n")
+	debugLog.Printf("RipFix job starting...\n")
 
 	// Step 0 workers
 	// We are ok with starting too many workers, as any unneeded will just exit
@@ -175,11 +202,11 @@ func main() {
 	progressChan, doneFunc := rfJob.Supervisor(maxP, workChan)
 	defer close(progressChan)
 
-	//outLog.Printf("\tSupervisor running...\n")
+	debugLog.Printf("\tSupervisor running...\n")
 
 	go racket.ProgressLogger(outLog, logMessages, nil, progressChan, barChan)
 
-	//outLog.Printf("\tProcessLogger running...\n")
+	debugLog.Printf("\tProcessLogger running...\n")
 
 	// Step 1 build work and dole it out
 	for _, file := range buildList(pdfs, barChan) {
@@ -192,6 +219,7 @@ func main() {
 			"out":          out,
 			"compress":     compress,
 			"skipExisting": skipExisting,
+			"reprocess":    reprocess,
 			"clean":        clean,
 		})
 	}
@@ -199,11 +227,11 @@ func main() {
 
 	// Signal we're done, so any idle workers can exit
 	doneFunc()
-	//outLog.Printf("\tDone sending work. Waiting...\n")
+	debugLog.Printf("\tDone sending work. Waiting...\n")
 
 	// wait until all of the workers are done
 	<-rfJob.IsDone()
-	//outLog.Printf("\tJob is done!\n")
+	debugLog.Printf("\tJob is done!\n")
 }
 
 // ripFixWorkFunc is a racket.WorkerFunc that will get handed Work by the Supervisor.
@@ -213,7 +241,7 @@ func ripFixWorkFunc(id any, w racket.Work, progressChan chan<- racket.Progress) 
 	progressChan <- racket.PMessagef("[WORKER %v] Work! %+v", id, w)
 
 	// Ensure path
-	err = os.MkdirAll(w.GetString("temp"), 0550)
+	err = os.MkdirAll(w.GetString("temp"), 0750)
 	if err != nil {
 		progressChan <- racket.PErrorf("[WORKER %v] Error MkdirAll '%s': %w", id, w.GetString("temp"), err)
 		return
@@ -225,8 +253,15 @@ func ripFixWorkFunc(id any, w racket.Work, progressChan chan<- racket.Progress) 
 	}
 
 	// Craft the future file names, and see if the compressed product exists for an early exit.
-	outFile := fmt.Sprintf("%s%s_fixed", w.GetString("out"), strings.TrimSuffix(filepath.Base(w.GetString("pdf")), filepath.Ext(filepath.Base(w.GetString("pdf"))))) // tesseract wants an extensionless filename
+	outFile := fmt.Sprintf("%s%s%s", w.GetString("out"), strings.TrimSuffix(filepath.Base(w.GetString("pdf")), filepath.Ext(filepath.Base(w.GetString("pdf")))), suffixFixed) // tesseract wants an extensionless filename
 	compressFile := fmt.Sprintf("%s_%s.pdf", outFile, w.GetString("compress"))
+	if w.GetBool("reprocess") && !(fileExists(outFile) || fileExists(compressFile)) {
+		// There is no need to process this file, as there is not a fixed variant existing.
+		progressChan <- racket.PMessagef("[WORKER %v] Reprocessing '%s' unneeded, as no fixed variant exists. Completed Work! Skipping all the things!", id, w.GetString("pdf"))
+		progressChan <- racket.PUpdate(1)
+		return
+	}
+
 	if w.GetString("compress") != "none" && w.GetBool("skipExisting") && fileExists(compressFile) {
 		// There is no need to craft _fixed if _fixed_[compress] exists.
 		progressChan <- racket.PMessagef("[WORKER %v] Compress file '%s' already exists. Completed Work! Skipping all the things!", id, compressFile)
@@ -281,7 +316,7 @@ func ripFixWorkFunc(id any, w racket.Work, progressChan chan<- racket.Progress) 
 func ripfix(workerID any, w racket.Work, progressChan chan<- racket.Progress) error {
 	var (
 		err     error
-		outFile = fmt.Sprintf("%s%s_fixed", w.GetString("out"), strings.TrimSuffix(filepath.Base(w.GetString("pdf")), filepath.Ext(filepath.Base(w.GetString("pdf"))))) // tesseract wants an extensionless filename
+		outFile = fmt.Sprintf("%s%s%s", w.GetString("out"), strings.TrimSuffix(filepath.Base(w.GetString("pdf")), filepath.Ext(filepath.Base(w.GetString("pdf")))), suffixFixed) // tesseract wants an extensionless filename
 	)
 
 	// Step 4a rip the PDF into TIFFs
@@ -338,6 +373,10 @@ func buildList(files []string, count chan racket.Progress) []string {
 	l := make([]string, 0)
 	for _, file := range files {
 		//fmt.Printf("[FILE] %s\n", file)
+		if strings.Contains(file, suffixFixed) {
+			// we don't want to process the output of previous processes!
+			continue
+		}
 		if strings.Contains(file, "*") || strings.Contains(file, "?") {
 			gfiles, err := filepath.Glob(file)
 			if err != nil {
@@ -356,6 +395,25 @@ func buildList(files []string, count chan racket.Progress) []string {
 		count <- racket.PEstimate(int64(len(l)))
 	}
 	return l
+}
+
+// calculateSHA256Sum calculates the SHA-256 checksum of a file.
+func calculateSHA256Sum(filePath string) (string, error) {
+	file, err := os.Open(filePath)
+	if err != nil {
+		return "", fmt.Errorf("failed to open file: %w", err)
+	}
+	defer file.Close() // Ensure the file is closed when the function exits
+
+	hash := sha256.New() // Create a new SHA-256 hash function
+
+	// Copy the file's content into the hash function
+	if _, err := io.Copy(hash, file); err != nil {
+		return "", fmt.Errorf("failed to copy file content to hash: %w", err)
+	}
+
+	// Get the final hash sum and encode it to a hexadecimal string
+	return hex.EncodeToString(hash.Sum(nil)), nil
 }
 
 // pdfToTiff constructs a pdftoppm Command to extract PDF pages as TIFF images.
