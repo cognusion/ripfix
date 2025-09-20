@@ -2,8 +2,8 @@ github.com/VividCortex/ewma v1.2.0 h1:f58SaIzcDXrSy3kWaHNvuJgJ3Nmz59Zji6XoJR/q1o
 github.com/VividCortex/ewma v1.2.0/go.mod h1:nz4BbCtbLyFDeC9SUHbtcT5644juEuWfUAUnGx7j5l4=
 github.com/cheggaaa/pb/v3 v3.1.7 h1:2FsIW307kt7A/rz/ZI2lvPO+v3wKazzE4K/0LtTWsOI=
 github.com/cheggaaa/pb/v3 v3.1.7/go.mod h1:/Ji89zfVPeC/u5j8ukD0MBPHt2bzTYp74lQ7KlgFWTQ=
-github.com/cognusion/go-racket v1.0.0 h1:6sGdevsd+ZGNgbT3dyBb039YQnMMCk6RjynYyRNFRbE=
-github.com/cognusion/go-racket v1.0.0/go.mod h1:5+cC/cJKA4pkchHPLNG1kMtsXfZ+OffQMef4OT9+iXA=
+github.com/cognusion/go-racket v1.0.1 h1:siRDJXUKsk5/ChiqRMWPJijM7e5gyRVL+8YhUpYaHOc=
+github.com/cognusion/go-racket v1.0.1/go.mod h1:5+cC/cJKA4pkchHPLNG1kMtsXfZ+OffQMef4OT9+iXA=
 github.com/cognusion/go-sequence v1.1.0 h1:MkYt6/iM4WaQh1WiuE1dnknwQEFdU0KBUbDf8ch6XPo=
 github.com/cognusion/go-sequence v1.1.0/go.mod h1:m1eTjD2rGredOjvHMTklg8Unb7mz5OMlFPyOG9dgLws=
 github.com/cognusion/semaphore v1.3.3 h1:ljJLkUi/Ju+cV+QGuNcGga2ZxYCbVJEaBeb28I13FQA=

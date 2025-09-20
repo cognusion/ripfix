@@ -4,7 +4,7 @@ go 1.24.4
 
 require (
 	github.com/cheggaaa/pb/v3 v3.1.7
-	github.com/cognusion/go-racket v1.0.0
+	github.com/cognusion/go-racket v1.0.1
 	github.com/cognusion/go-sequence v1.1.0
 	github.com/gofrs/flock v0.12.1
 	github.com/spf13/pflag v1.0.10
