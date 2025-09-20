@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/cheggaaa/pb/v3"
@@ -41,6 +42,7 @@ var (
 	logFile      string
 	debug        bool
 	dupes        bool
+	dupeMap      sync.Map
 )
 
 func init() {
@@ -388,6 +390,17 @@ func buildList(files []string, count chan racket.Progress) []string {
 			panic(fmt.Errorf("file %s cannot be found: %w", file, err))
 		} else if !s.IsDir() {
 			// file
+			if dupes {
+				h, e := calculateSHA256Sum(file)
+				if e != nil {
+					panic(e)
+				}
+				v, loaded := dupeMap.LoadOrStore(h, file)
+				if loaded {
+					// DUPE! We aren't handling those yet
+					panic(fmt.Errorf("DUPE! File '%s' and '%s' share a sum", v, file))
+				}
+			}
 			l = append(l, file)
 		}
 	}
@@ -399,6 +412,7 @@ func buildList(files []string, count chan racket.Progress) []string {
 
 // calculateSHA256Sum calculates the SHA-256 checksum of a file.
 func calculateSHA256Sum(filePath string) (string, error) {
+	//#nosec G304 -- Yes, but no.
 	file, err := os.Open(filePath)
 	if err != nil {
 		return "", fmt.Errorf("failed to open file: %w", err)
